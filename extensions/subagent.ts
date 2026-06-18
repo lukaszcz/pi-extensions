@@ -2,8 +2,8 @@
  * Subagent Tools
  *
  * Two tools for spawning subagents with isolated context:
- * - subagent: single task (model + task, both required)
- * - subagents: parallel tasks (tasks array, required)
+ * - subagent: single task (model optional, defaults to session model; task required)
+ * - subagents: parallel tasks (tasks array, required; per-task model optional)
  *
  * Split into separate tools so models see unambiguous schemas.
  */
@@ -807,6 +807,17 @@ export default function (pi: ExtensionAPI) {
 		throw new Error(`Unknown model "${model}". Available: ${[...models.keys()].join(", ")}`);
 	};
 
+	// Resolve the current session model to a "provider/id" spec. Used as the
+	// default when the caller omits the `model` parameter. Throws if the
+	// session has no active model.
+	const resolveSessionModel = (ctx: ExtensionContext): string => {
+		const m = ctx.model;
+		if (!m) {
+			throw new Error("No model specified and the session has no active model. Pass an explicit model.");
+		}
+		return `${m.provider}/${m.id}`;
+	};
+
 	// Shared renderResult for both tools (already dispatches on details.mode)
 	const sharedRenderResult = (result: any, { expanded }: { expanded: boolean }, theme: any) => {
 		const details = result.details as SubagentDetails | undefined;
@@ -1044,9 +1055,9 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description:
-			`Spawn a subagent with isolated context. Params: model, task, context (optional), tools (optional array).\n\n${modelListXml}`,
+			`Spawn a subagent with isolated context. Params: task, model (optional, defaults to the session's current model), context (optional), tools (optional array).\n\n${modelListXml}`,
 		parameters: Type.Object({
-			model: Type.String({ description: `Model ID. Available: ${modelListShort}` }),
+			model: Type.Optional(Type.String({ description: `Model ID. Defaults to the session's current model when omitted. Available: ${modelListShort}` })),
 			task: Type.String({ description: "The task instruction for the subagent" }),
 			context: Type.Optional(Type.String({ description: "Optional XML-structured context to pass" })),
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Tool names to enable (default: all)" })),
@@ -1054,8 +1065,11 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_id, params, signal, onUpdate, ctx) {
 			const models = getAvailableModels(ctx);
-			// Throws on bad model → agent loop sets isError properly
-			const modelSpec = resolveModel(params.model, models);
+			// Throws on bad model → agent loop sets isError properly.
+			// Falls back to the session's current model when omitted.
+			const modelSpec = params.model
+				? resolveModel(params.model, models)
+				: resolveSessionModel(ctx);
 
 			const result = await runSubagent(
 				ctx.cwd,
@@ -1089,7 +1103,7 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme) {
-			const model = args.model || "?";
+			const model = args.model || "(session model)";
 			const task = args.task || "...";
 
 			let text = theme.fg("toolTitle", theme.bold("subagent "));
@@ -1111,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Parallel subagents tool ──
 	const TaskItem = Type.Object({
-		model: Type.String({ description: "Model ID" }),
+		model: Type.Optional(Type.String({ description: "Model ID. Defaults to the session's current model when omitted." })),
 		task: Type.String({ description: "Task instruction" }),
 		context: Type.Optional(Type.String({ description: "Optional XML context" })),
 		tools: Type.Optional(Type.Array(Type.String(), { description: "Tool names to enable" })),
@@ -1121,7 +1135,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagents",
 		label: "Subagents (parallel)",
 		description:
-			`Spawn multiple subagents in parallel. Each task runs concurrently with isolated context. Same models as subagent tool.`,
+			`Spawn multiple subagents in parallel. Each task runs concurrently with isolated context. The model field on each task is optional and defaults to the session's current model. Same models as subagent tool.`,
 		parameters: Type.Object({
 			tasks: Type.Array(TaskItem, { description: `Array of tasks for parallel execution (max ${MAX_PARALLEL})`, minItems: 1 }),
 		}),
@@ -1134,8 +1148,9 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`Too many tasks (${params.tasks.length}). Max is ${MAX_PARALLEL}.`);
 			}
 
-			// Validate all models upfront (throws on bad model)
-			const resolvedModels = params.tasks.map((t) => resolveModel(t.model, models));
+			// Validate all models upfront (throws on bad model). Tasks
+			// without an explicit model fall back to the session's model.
+			const resolvedModels = params.tasks.map((t) => t.model ? resolveModel(t.model, models) : resolveSessionModel(ctx));
 
 			const allResults: SubagentResult[] = params.tasks.map((t, i) => ({
 				model: resolvedModels[i],
@@ -1205,7 +1220,7 @@ export default function (pi: ExtensionAPI) {
 			text += theme.fg("accent", `parallel (${tasks.length} tasks)`);
 			for (const t of tasks.slice(0, 3)) {
 				const preview = t.task.length > 40 ? t.task.slice(0, 40) + "..." : t.task;
-				text += `\n  ${theme.fg("accent", t.model)} ${theme.fg("dim", preview)}`;
+				text += `\n  ${theme.fg("accent", t.model || "(session)")} ${theme.fg("dim", preview)}`;
 			}
 			if (tasks.length > 3) {
 				text += `\n  ${theme.fg("muted", `... +${tasks.length - 3} more`)}`;
