@@ -2,8 +2,8 @@
  * Subagent Tools
  *
  * Two tools for spawning subagents with isolated context:
- * - subagent: single task (model optional, defaults to session model; task required)
- * - subagents: parallel tasks (tasks array, required; per-task model optional)
+ * - subagent: single task (inherits the session model; task required)
+ * - subagents: parallel tasks (tasks array, required; all inherit the session model)
  *
  * Split into separate tools so models see unambiguous schemas.
  */
@@ -73,7 +73,6 @@ interface SubagentResult {
 interface SubagentDetails {
 	mode: "single" | "parallel";
 	results: SubagentResult[];
-	availableModels?: string[];
 }
 
 /** Check if a subagent result is an error (used consistently throughout) */
@@ -398,132 +397,6 @@ function formatUsage(u: UsageStats, model: string): string {
 	return parts.join(" ");
 }
 
-// Read enabledModels from settings.json directly since scoped models
-// aren't exposed in the extension API
-function readEnabledModels(): string[] {
-	try {
-		const settingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
-		const content = fs.readFileSync(settingsPath, "utf-8");
-		const settings = JSON.parse(content);
-		return settings.enabledModels ?? [];
-	} catch {
-		return [];
-	}
-}
-
-// Model skills: prefix -> description + ratings (1-10 scale)
-interface ModelSkill {
-	prefix: string;      // e.g. "openrouter/openai" or "anthropic/claude-sonnet-4-5"
-	for: string;         // short description of strengths
-	weaknesses?: string; // optional weaknesses
-	// Ratings (1-10 scale, higher is better)
-	abstract?: number;     // big-picture thinking, architectural reasoning
-	detailed?: number;     // step-by-step logic, edge cases, debugging
-	toolUse?: number;      // reliable multi-step file/code operations
-	instruction?: number;  // follows instructions precisely
-	creativity?: number;   // novel approaches, writing quality
-	speed?: number;        // response time
-	cost?: number;         // cost efficiency (higher = cheaper)
-	context?: number;      // context window size
-}
-
-function parseSimpleFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
-	const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
-	if (!match) return { frontmatter: {}, body: content };
-	
-	const frontmatter: Record<string, string> = {};
-	for (const line of match[1].split(/\r?\n/)) {
-		const colonIdx = line.indexOf(":");
-		if (colonIdx > 0) {
-			const key = line.slice(0, colonIdx).trim();
-			const value = line.slice(colonIdx + 1).trim();
-			frontmatter[key] = value;
-		}
-	}
-	return { frontmatter, body: match[2] };
-}
-
-function loadModelSkills(): ModelSkill[] {
-	const skills: ModelSkill[] = [];
-	const skillsDir = path.join(os.homedir(), ".pi", "agent", "model-skills");
-	
-	if (!fs.existsSync(skillsDir)) return skills;
-	
-	let entries: fs.Dirent[];
-	try {
-		entries = fs.readdirSync(skillsDir, { withFileTypes: true });
-	} catch {
-		return skills;
-	}
-	
-	for (const entry of entries) {
-		if (!entry.name.endsWith(".md")) continue;
-		if (!entry.isFile()) continue;
-		
-		const filePath = path.join(skillsDir, entry.name);
-		let content: string;
-		try {
-			content = fs.readFileSync(filePath, "utf-8");
-		} catch {
-			continue;
-		}
-		
-		const { frontmatter } = parseSimpleFrontmatter(content);
-		if (frontmatter.model && frontmatter.for) {
-			const parseNum = (v: string | undefined): number | undefined => {
-				if (!v) return undefined;
-				const n = parseInt(v, 10);
-				return isNaN(n) ? undefined : n;
-			};
-			skills.push({
-				prefix: frontmatter.model.toLowerCase(),
-				for: frontmatter.for,
-				weaknesses: frontmatter.weaknesses,
-				abstract: parseNum(frontmatter.abstract),
-				detailed: parseNum(frontmatter.detailed),
-				toolUse: parseNum(frontmatter["tool-use"]),
-				instruction: parseNum(frontmatter.instruction),
-				creativity: parseNum(frontmatter.creativity),
-				speed: parseNum(frontmatter.speed),
-				cost: parseNum(frontmatter.cost),
-				context: parseNum(frontmatter.context),
-			});
-		}
-	}
-	
-	// Sort by prefix length descending (more specific matches first)
-	skills.sort((a, b) => b.prefix.length - a.prefix.length);
-	return skills;
-}
-
-function getModelSkill(skills: ModelSkill[], modelId: string): ModelSkill | undefined {
-	const id = modelId.toLowerCase();
-	// Substring match, longest match wins (skills already sorted by length desc)
-	return skills.find(s => id.includes(s.prefix));
-}
-
-function getAvailableModels(ctx: ExtensionContext): Map<string, { provider: string; id: string }> {
-	const models = new Map<string, { provider: string; id: string }>();
-	const enabledModels = readEnabledModels();
-	// Normalize to lowercase set for exact matching
-	const enabledSet = new Set(enabledModels.map((m) => m.toLowerCase()));
-
-	for (const model of ctx.modelRegistry.getAvailable()) {
-
-		const fullSpec = `${model.provider}/${model.id}`.toLowerCase();
-
-		// If enabledModels is set, only include exact matches
-		if (enabledSet.size > 0 && !enabledSet.has(fullSpec)) {
-			continue;
-		}
-
-		// Key by full spec (provider/id) for unambiguous lookup
-		models.set(fullSpec, { provider: model.provider, id: model.id });
-	}
-
-	return models;
-}
-
 async function runSubagent(
 	cwd: string,
 	model: string,
@@ -750,70 +623,12 @@ export default function (pi: ExtensionAPI) {
 		restoreUsageFromSession(ctx);
 	});
 
-	// Load model skills and enabled models
-	const skills = loadModelSkills();
-	const enabledModels = readEnabledModels();
-	
-	// Build model list with skills annotations as XML
-	const axesLegend = `  <axes description="ratings 1-10, higher is better">
-    <axis name="abstract" description="big-picture thinking, architectural reasoning, conceptual leaps" />
-    <axis name="detailed" description="step-by-step logic, edge cases, debugging, attention to detail" />
-    <axis name="tool-use" description="reliable multi-step file/code operations" />
-    <axis name="instruction" description="follows instructions precisely, format compliance" />
-    <axis name="creativity" description="novel approaches, writing quality, thinking outside the box" />
-    <axis name="speed" description="response time" />
-    <axis name="cost" description="cost efficiency (higher = cheaper)" />
-    <axis name="context" description="context window size" />
-  </axes>`;
-
-	const formatModelXml = (modelId: string): string => {
-		const skill = getModelSkill(skills, modelId);
-		if (skill) {
-			const attrs: string[] = [`id="${modelId}"`, `for="${skill.for}"`];
-			if (skill.weaknesses) attrs.push(`weaknesses="${skill.weaknesses}"`);
-			if (skill.abstract !== undefined) attrs.push(`abstract="${skill.abstract}"`);
-			if (skill.detailed !== undefined) attrs.push(`detailed="${skill.detailed}"`);
-			if (skill.toolUse !== undefined) attrs.push(`tool-use="${skill.toolUse}"`);
-			if (skill.instruction !== undefined) attrs.push(`instruction="${skill.instruction}"`);
-			if (skill.creativity !== undefined) attrs.push(`creativity="${skill.creativity}"`);
-			if (skill.speed !== undefined) attrs.push(`speed="${skill.speed}"`);
-			if (skill.cost !== undefined) attrs.push(`cost="${skill.cost}"`);
-			if (skill.context !== undefined) attrs.push(`context="${skill.context}"`);
-			return `  <model ${attrs.join(" ")} />`;
-		}
-		return `  <model id="${modelId}" />`;
-	};
-	
-	const modelListXml = enabledModels.length > 0
-		? `<available-models>\n${axesLegend}\n${enabledModels.map(formatModelXml).join("\n")}\n</available-models>`
-		: "(all models with API keys)";
-	
-	const modelListShort = enabledModels.join(", ") || "(all models with API keys)";
-
-	// Shared model resolution with fuzzy matching. Throws on failure
-	// so the agent loop properly marks the result as isError.
-	const resolveModel = (model: string, models: Map<string, { provider: string; id: string }>): string => {
-		// Exact match first
-		const exact = models.get(model.toLowerCase());
-		if (exact) return `${exact.provider}/${exact.id}`;
-
-		// Fuzzy: substring match on full spec
-		const lower = model.toLowerCase();
-		const matches = [...models.entries()].filter(([key]) => key.includes(lower));
-		if (matches.length === 1) return `${matches[0][1].provider}/${matches[0][1].id}`;
-		if (matches.length > 1) {
-			throw new Error(`Ambiguous model "${model}". Matches: ${matches.map(m => m[0]).join(", ")}`);
-		}
-		throw new Error(`Unknown model "${model}". Available: ${[...models.keys()].join(", ")}`);
-	};
-
-	// Resolve the current session model to a "provider/id" spec. Used as the
-	// default when the caller omits the `model` parameter. Throws if the
-	// session has no active model.
+	// Resolve the current session model to a "provider/id" spec. Subagents always
+	// inherit this model and do not accept explicit model overrides.
 	const resolveSessionModel = (ctx: ExtensionContext): string => {
 		const m = ctx.model;
 		if (!m) {
-			throw new Error("No model specified and the session has no active model. Pass an explicit model.");
+			throw new Error("The session has no active model; subagents inherit the session model.");
 		}
 		return `${m.provider}/${m.id}`;
 	};
@@ -1055,21 +870,15 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description:
-			`Spawn a subagent with isolated context. Params: task, model (optional, defaults to the session's current model), context (optional), tools (optional array).\n\n${modelListXml}`,
+			"Spawn a subagent with isolated context. The subagent always inherits the current session model. Params: task, context (optional), tools (optional array).",
 		parameters: Type.Object({
-			model: Type.Optional(Type.String({ description: `Model ID. Defaults to the session's current model when omitted. Available: ${modelListShort}` })),
 			task: Type.String({ description: "The task instruction for the subagent" }),
 			context: Type.Optional(Type.String({ description: "Optional XML-structured context to pass" })),
 			tools: Type.Optional(Type.Array(Type.String(), { description: "Tool names to enable (default: all)" })),
 		}),
 
 		async execute(_id, params, signal, onUpdate, ctx) {
-			const models = getAvailableModels(ctx);
-			// Throws on bad model → agent loop sets isError properly.
-			// Falls back to the session's current model when omitted.
-			const modelSpec = params.model
-				? resolveModel(params.model, models)
-				: resolveSessionModel(ctx);
+			const modelSpec = resolveSessionModel(ctx);
 
 			const result = await runSubagent(
 				ctx.cwd,
@@ -1082,7 +891,7 @@ export default function (pi: ExtensionAPI) {
 					? (r) =>
 							onUpdate({
 								content: [{ type: "text", text: r.output || "(running...)" }],
-								details: { mode: "single", results: [r], availableModels: [...models.keys()] } as SubagentDetails,
+								details: { mode: "single", results: [r] } as SubagentDetails,
 							})
 					: undefined,
 			);
@@ -1098,16 +907,15 @@ export default function (pi: ExtensionAPI) {
 
 			return {
 				content: [{ type: "text", text: result.output || "(no output)" }],
-				details: { mode: "single", results: [result], availableModels: [...models.keys()] } as SubagentDetails,
+				details: { mode: "single", results: [result] } as SubagentDetails,
 			};
 		},
 
 		renderCall(args, theme) {
-			const model = args.model || "(session model)";
 			const task = args.task || "...";
 
 			let text = theme.fg("toolTitle", theme.bold("subagent "));
-			text += theme.fg("accent", model);
+			text += theme.fg("accent", "session model");
 			if (args.tools?.length) {
 				text += theme.fg("muted", ` [${args.tools.join(", ")}]`);
 			}
@@ -1125,7 +933,6 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Parallel subagents tool ──
 	const TaskItem = Type.Object({
-		model: Type.Optional(Type.String({ description: "Model ID. Defaults to the session's current model when omitted." })),
 		task: Type.String({ description: "Task instruction" }),
 		context: Type.Optional(Type.String({ description: "Optional XML context" })),
 		tools: Type.Optional(Type.Array(Type.String(), { description: "Tool names to enable" })),
@@ -1135,25 +942,20 @@ export default function (pi: ExtensionAPI) {
 		name: "subagents",
 		label: "Subagents (parallel)",
 		description:
-			`Spawn multiple subagents in parallel. Each task runs concurrently with isolated context. The model field on each task is optional and defaults to the session's current model. Same models as subagent tool.`,
+			"Spawn multiple subagents in parallel. Each task runs concurrently with isolated context and inherits the current session model.",
 		parameters: Type.Object({
 			tasks: Type.Array(TaskItem, { description: `Array of tasks for parallel execution (max ${MAX_PARALLEL})`, minItems: 1 }),
 		}),
 
 		async execute(_id, params, signal, onUpdate, ctx) {
-			const models = getAvailableModels(ctx);
-			const availableModels = [...models.keys()];
-
 			if (params.tasks.length > MAX_PARALLEL) {
 				throw new Error(`Too many tasks (${params.tasks.length}). Max is ${MAX_PARALLEL}.`);
 			}
 
-			// Validate all models upfront (throws on bad model). Tasks
-			// without an explicit model fall back to the session's model.
-			const resolvedModels = params.tasks.map((t) => t.model ? resolveModel(t.model, models) : resolveSessionModel(ctx));
+			const sessionModel = resolveSessionModel(ctx);
 
-			const allResults: SubagentResult[] = params.tasks.map((t, i) => ({
-				model: resolvedModels[i],
+			const allResults: SubagentResult[] = params.tasks.map((t) => ({
+				model: sessionModel,
 				task: t.task,
 				context: t.context,
 				exitCode: -1,
@@ -1168,17 +970,17 @@ export default function (pi: ExtensionAPI) {
 					const running = allResults.length - done;
 					onUpdate({
 						content: [{ type: "text", text: `${done}/${allResults.length} done, ${running} running...` }],
-						details: { mode: "parallel", results: allResults, availableModels } as SubagentDetails,
+						details: { mode: "parallel", results: allResults } as SubagentDetails,
 					});
 				}
 			};
 
 			emitUpdate();
 
-			await mapWithConcurrency(params.tasks, MAX_CONCURRENCY, async (t: { model: string; task: string; context?: string; tools?: string[] }, index) => {
+			await mapWithConcurrency(params.tasks, MAX_CONCURRENCY, async (t: { task: string; context?: string; tools?: string[] }, index) => {
 				const result = await runSubagent(
 					ctx.cwd,
-					resolvedModels[index],
+					sessionModel,
 					t.task,
 					t.context,
 					t.tools,
@@ -1210,7 +1012,7 @@ export default function (pi: ExtensionAPI) {
 			// Don't throw on partial failure — report results, let model decide
 			return {
 				content: [{ type: "text", text: `${successCount}/${allResults.length} succeeded\n\n${fullOutputs.join("\n\n---\n\n")}` }],
-				details: { mode: "parallel", results: allResults, availableModels } as SubagentDetails,
+				details: { mode: "parallel", results: allResults } as SubagentDetails,
 			};
 		},
 
@@ -1220,7 +1022,7 @@ export default function (pi: ExtensionAPI) {
 			text += theme.fg("accent", `parallel (${tasks.length} tasks)`);
 			for (const t of tasks.slice(0, 3)) {
 				const preview = t.task.length > 40 ? t.task.slice(0, 40) + "..." : t.task;
-				text += `\n  ${theme.fg("accent", t.model || "(session)")} ${theme.fg("dim", preview)}`;
+				text += `\n  ${theme.fg("dim", preview)}`;
 			}
 			if (tasks.length > 3) {
 				text += `\n  ${theme.fg("muted", `... +${tasks.length - 3} more`)}`;
@@ -1231,13 +1033,12 @@ export default function (pi: ExtensionAPI) {
 		renderResult: sharedRenderResult,
 	});
 
-	// Command: /subagent <model> <task>
+	// Command: /subagent <task>
 	pi.registerCommand("subagent", {
-		description: "Delegate to a subagent: /subagent <model> <task>",
+		description: "Delegate to a subagent: /subagent <task>",
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
-				const models = getAvailableModels(ctx);
-				ctx.ui.notify(`Usage: /subagent <model> <task>\nModels: ${[...models.keys()].join(", ")}`, "info");
+				ctx.ui.notify("Usage: /subagent <task>", "info");
 				return;
 			}
 
