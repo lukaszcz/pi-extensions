@@ -399,14 +399,17 @@ function formatUsage(u: UsageStats, model: string): string {
 
 async function runSubagent(
 	cwd: string,
-	model: string,
+	model: { provider: string; id: string; display: string },
 	task: string,
 	context: string | undefined,
 	tools: string[] | undefined,
 	signal: AbortSignal | undefined,
 	onUpdate: ((result: SubagentResult) => void) | undefined,
 ): Promise<SubagentResult> {
-	const args = ["--mode", "json", "-p", "--no-session", "--model", model];
+	// Pass provider and model as separate CLI flags. A provider/id string can be
+	// ambiguous when multiple providers serve the same model id (or model ids
+	// themselves contain slashes), so the provider must be preserved explicitly.
+	const args = ["--mode", "json", "-p", "--no-session", "--provider", model.provider, "--model", model.id];
 
 	// Let the subagent know it's a subagent to discourage recursive spawning
 	args.push("--append-system-prompt", "You are a subagent. Complete your task directly.");
@@ -425,7 +428,7 @@ async function runSubagent(
 	args.push(prompt);
 
 	const result: SubagentResult = {
-		model,
+		model: model.display,
 		task,
 		context,
 		exitCode: -1, // -1 = still running
@@ -623,14 +626,14 @@ export default function (pi: ExtensionAPI) {
 		restoreUsageFromSession(ctx);
 	});
 
-	// Resolve the current session model to a "provider/id" spec. Subagents always
-	// inherit this model and do not accept explicit model overrides.
-	const resolveSessionModel = (ctx: ExtensionContext): string => {
+	// Resolve the current session model. Subagents always inherit both provider and
+	// model id and do not accept explicit model overrides.
+	const resolveSessionModel = (ctx: ExtensionContext): { provider: string; id: string; display: string } => {
 		const m = ctx.model;
 		if (!m) {
 			throw new Error("The session has no active model; subagents inherit the session model.");
 		}
-		return `${m.provider}/${m.id}`;
+		return { provider: m.provider, id: m.id, display: `${m.provider}/${m.id}` };
 	};
 
 	// Shared renderResult for both tools (already dispatches on details.mode)
@@ -955,7 +958,7 @@ export default function (pi: ExtensionAPI) {
 			const sessionModel = resolveSessionModel(ctx);
 
 			const allResults: SubagentResult[] = params.tasks.map((t) => ({
-				model: sessionModel,
+				model: sessionModel.display,
 				task: t.task,
 				context: t.context,
 				exitCode: -1,
