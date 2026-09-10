@@ -769,7 +769,7 @@ export default function goalModeExtension(pi: ExtensionAPI) {
 				if (!await ctx.ui.confirm("Replace current goal?", `Current: ${goal.objective}\nNew: ${objective}`)) return;
 			}
 			setGoal(objective, null, ctx);
-			if (goal?.status === "active") pi.sendUserMessage(buildStartPrompt(goal));
+			if (goal?.status === "active") pi.sendUserMessage(buildStartPrompt(goal), { deliverAs: "steer" });
 		},
 	});
 
